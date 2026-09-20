@@ -39,6 +39,21 @@ export const Player = schema({
 });
 export type Player = SchemaType<typeof Player>;
 
+/**
+ * A built gun. Minimal on purpose (8A: placement/sync only) — no targeting,
+ * cooldown or damage state yet. `tileIndex` + `roomIndex` identify the build
+ * slot it occupies; x/y are the authoritative pixel centre, so clients render
+ * it without recomputing room geometry.
+ */
+export const Gun = schema({
+  roomIndex: t.int8(),
+  tileIndex: t.int8(),
+  x: t.number(),
+  y: t.number(),
+  type: t.string().default("basic"),
+});
+export type Gun = SchemaType<typeof Gun>;
+
 export const MyRoomState = schema({
 
   players: t.map(Player),
@@ -66,6 +81,12 @@ export const MyRoomState = schema({
   // milestone. Populated with BUILD_TILES_PER_ROOM * 4 `false` entries in
   // MyRoom.onCreate().
   buildTilesOccupied: t.array("boolean"),
+
+  // Authoritative guns, keyed by a unique server-generated id ("gun-1", …).
+  // Public: every client sees every gun. Created only by a validated
+  // "build" message (see MyRoom.ts); buildTilesOccupied stays the
+  // occupancy flag for the tile the gun sits on.
+  guns: t.map(Gun),
 
 });
 export type MyRoomState = SchemaType<typeof MyRoomState>;

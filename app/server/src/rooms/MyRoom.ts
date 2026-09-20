@@ -1,11 +1,11 @@
 import { Room, Client, CloseCode, type StepContext } from "colyseus";
-import { MyRoomState, Player, MoveInput } from "./schema/MyRoomState.js";
+import { MyRoomState, Player, Gun, MoveInput } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
 import {
   TICK_RATE, SPAWN_TILES, getSpawnPixel,
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
   getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
-  BUILD_TILES_PER_ROOM, GUN_COST, COIN_INTERVAL_MS,
+  BUILD_TILES_PER_ROOM, getRoomBuildTilePixel, GUN_COST, COIN_INTERVAL_MS,
 } from "../shared/constants.js";
 
 interface ToggleDoorMessage {
@@ -33,6 +33,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   });
 
   private joinCount = 0;
+  private nextGunId = 1;
 
   // Per-session accrued sleep time in ms, not yet converted into a whole
   // coin — a plain map alongside `inputs` rather than schema state, since
@@ -161,8 +162,18 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (this.state.buildTilesOccupied[globalTileIndex]) { return; }
       if (player.coins < GUN_COST) { return; }
 
+      const pos = getRoomBuildTilePixel(ROOM_POSITIONS[player.roomIndex], tileIndex);
+      const gunId = `gun-${this.nextGunId++}`;
+
       player.coins -= GUN_COST;
       this.state.buildTilesOccupied[globalTileIndex] = true;
+      this.state.guns.set(gunId, new Gun({
+        roomIndex: player.roomIndex,
+        tileIndex,
+        x: pos.x,
+        y: pos.y,
+        type: "basic",
+      }));
     },
   };
 

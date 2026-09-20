@@ -26,7 +26,7 @@ export class GameScene extends Phaser.Scene {
     // (roomIndex * buildTilesPerRoom + tileIndex) — see MyRoomState.buildTilesOccupied.
     private buildTilesByGlobalIndex: BuildTile[] = [];
     private guns: Gun[] = [];
-    private gunsByGlobalIndex = new Map<number, Gun>();
+    private gunsById = new Map<string, Gun>();
 
     // Authoritative room the local player currently occupies, mirrored
     // from the server exactly like `isSleeping` below — build indicators
@@ -130,16 +130,32 @@ export class GameScene extends Phaser.Scene {
 
                 // The server owns occupancy for every build-tile slot
                 // across all four rooms, keyed by the same global index
-                // BuildTile uses (see buildTilesByGlobalIndex). This is
-                // also the entire gun sync: a gun is spawned/removed here
-                // purely from this flag, visible to every client
-                // regardless of whose room it's in.
+                // BuildTile uses (see buildTilesByGlobalIndex). This only
+                // drives the tile's "+"/occupied look; guns themselves
+                // come from the authoritative `guns` map below.
                 $(room.state).buildTilesOccupied.onAdd((isOccupied: boolean, globalIndex: number) => {
                     this.setBuildTileOccupied(globalIndex, isOccupied);
                 }, true);
 
                 $(room.state).buildTilesOccupied.onChange((isOccupied: boolean, globalIndex: number) => {
                     this.setBuildTileOccupied(globalIndex, isOccupied);
+                });
+
+                // Guns are public authoritative entities: every client
+                // renders every gun at the server's position.
+                $(room.state).guns.onAdd((gunState, gunId: string) => {
+                    if (this.gunsById.has(gunId)) { return; }
+                    const gun = new Gun(this, gunState.x, gunState.y);
+                    this.gunsById.set(gunId, gun);
+                    this.guns.push(gun);
+                }, true);
+
+                $(room.state).guns.onRemove((_gunState, gunId: string) => {
+                    const gun = this.gunsById.get(gunId);
+                    if (!gun) { return; }
+                    gun.destroy();
+                    this.gunsById.delete(gunId);
+                    this.guns = this.guns.filter((existing) => existing !== gun);
                 });
 
                 $(room.state).players.onAdd((remotePlayerState, sessionId) => {
@@ -702,30 +718,13 @@ export class GameScene extends Phaser.Scene {
 
     // Reacts to the server's authoritative buildTilesOccupied flag for one
     // global tile index — never set locally by a click. Drives both the
-    // tile's own "+"/occupied visual and, since occupancy IS the entire
-    // gun sync for this milestone, spawning/removing the Gun that
-    // represents it — for every client, regardless of whose room it's in.
+    // tile's own "+"/occupied visual. The Gun itself comes from the
+    // authoritative `guns` map, not from this flag.
     private setBuildTileOccupied(globalIndex: number, isOccupied: boolean) {
         const tile = this.buildTilesByGlobalIndex[globalIndex];
 
         if (tile) {
             tile.setOccupied(isOccupied);
-        }
-
-        if (isOccupied) {
-            if (!this.gunsByGlobalIndex.has(globalIndex) && tile) {
-                const gun = new Gun(this, tile.x, tile.y);
-                this.gunsByGlobalIndex.set(globalIndex, gun);
-                this.guns.push(gun);
-            }
-        } else {
-            const gun = this.gunsByGlobalIndex.get(globalIndex);
-
-            if (gun) {
-                gun.destroy();
-                this.gunsByGlobalIndex.delete(globalIndex);
-                this.guns = this.guns.filter((existing) => existing !== gun);
-            }
         }
 
         this.updateBuildVisibility();
