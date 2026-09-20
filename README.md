@@ -6,6 +6,11 @@ Doorbell is a **5-player asymmetric wagering game built on Solana**. At the star
 
 The other four players must defend their own dorms by spending in-game coins to build **guns, mines, and gates**. The Ghost's objective is to break through these defenses and eliminate the defenders, while the defenders work together to protect their dorms and survive.
 
+The **Solana blockchain handles the wagering system**. Each player deposits their SOL bet into a secure vault at the beginning of the match. Once the game ends, the vault distributes the collected SOL according to the game's outcome and rules.
+
+The game creates an asymmetric experience where the Ghost focuses on attacking and breaking defenses, while the other four players focus on resource management, strategy, and survival.
+
+
 ### 💰 On-Chain Wagering
 
 Players wager **SOL** to enter the game. The wagers are held in a **Solana vault** throughout the match and are distributed according to the final game outcome.
