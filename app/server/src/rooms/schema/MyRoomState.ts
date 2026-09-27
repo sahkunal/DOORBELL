@@ -1,4 +1,6 @@
 import { schema, t, type SchemaType } from "@colyseus/schema";
+import { PLAYER_MAX_HEALTH } from "../../shared/constants.js";
+import type { MatchPhase } from "../../shared/matchPhase.js";
 
 /**
  * One input frame, consumed by `Room.defineInput()`. Flat primitives only, and
@@ -36,21 +38,41 @@ export const Player = schema({
   // (a successful "build" message) — a client never sets this directly,
   // and a build request never carries a claimed balance.
   coins: t.number().default(0),
+
+  // Public, not secret. Nothing assigns "ghost" yet — role assignment
+  // comes with match start in a later milestone.
+  role: t.string<"defender" | "ghost">().default("defender"),
+
+  // Server-only mutation: reduced by shared/gunDamage.ts on a real gun
+  // shot, clamped at 0. Nothing happens at 0 yet (no death/respawn).
+  maxHealth: t.number().default(PLAYER_MAX_HEALTH),
+  health: t.number().default(PLAYER_MAX_HEALTH),
+
+  // Lobby: set only by the sender's own "ready" message, only in the lobby.
+  ready: t.boolean().default(false),
+
+  // 1-based join order, for the lobby's "Player N" label.
+  playerNumber: t.int8().default(0),
 });
 export type Player = SchemaType<typeof Player>;
 
-/**
- * A built gun. Minimal on purpose (8A: placement/sync only) — no targeting,
- * cooldown or damage state yet. `tileIndex` + `roomIndex` identify the build
- * slot it occupies; x/y are the authoritative pixel centre, so clients render
- * it without recomputing room geometry.
- */
+// One built defense. Created only by MyRoom's "build" handler; x/y are
+// derived server-side from roomIndex + tileIndex, never client-supplied.
 export const Gun = schema({
+  id: t.string(),
   roomIndex: t.int8(),
   tileIndex: t.int8(),
   x: t.number(),
   y: t.number(),
   type: t.string().default("basic"),
+
+  // Session id of the Ghost this gun is currently targeting, or "" for
+  // none. Recomputed server-side every tick (see MyRoom.updateGunTargets).
+  targetId: t.string().default(""),
+
+  // Increments by 1 every time this gun fires (see shared/gunFiring.ts).
+  // The only public firing signal; the cooldown itself stays server-only.
+  fireSequence: t.number().default(0),
 });
 export type Gun = SchemaType<typeof Gun>;
 
@@ -74,19 +96,27 @@ export const MyRoomState = schema({
   // Flat, one entry per build-tile slot across all four rooms — index
   // `roomIndex * BUILD_TILES_PER_ROOM + tileIndex` (see
   // server/src/shared/constants.ts ROOM_BUILD_TILES/BUILD_TILES_PER_ROOM).
-  // True once a gun has been built there. This single array is both the
-  // server's placement-validation state (occupancy) and the entire
-  // client sync for guns — a gun's room/tile/position is fully recovered
-  // from its index, so no separate "guns" list is needed for this
-  // milestone. Populated with BUILD_TILES_PER_ROOM * 4 `false` entries in
-  // MyRoom.onCreate().
+  // True once something has been built there — the occupancy check for
+  // placement validation. Populated with BUILD_TILES_PER_ROOM * 4 `false`
+  // entries in MyRoom.onCreate().
   buildTilesOccupied: t.array("boolean"),
 
-  // Authoritative guns, keyed by a unique server-generated id ("gun-1", …).
-  // Public: every client sees every gun. Created only by a validated
-  // "build" message (see MyRoom.ts); buildTilesOccupied stays the
-  // occupancy flag for the tile the gun sits on.
+  // Every built gun, keyed by its server-generated id ("gun-1", ...).
   guns: t.map(Gun),
+
+  // Server-owned match phase — see shared/matchPhase.ts. Clients only read it.
+  phase: t.string<MatchPhase>().default("lobby"),
+
+  // Share code for this room; identical to the Colyseus roomId, so
+  // `client.joinById(code)` is the whole join-by-code mechanism.
+  roomCode: t.string().default(""),
+
+  // Session id of the lobby host (first joiner; passed on if they leave).
+  hostId: t.string().default(""),
+
+  // Informational countdown for the HUD, whole seconds, updated only when
+  // it changes. The server's own ms timer (MyRoom) is what ends preparation.
+  preparationSecondsLeft: t.int8().default(0),
 
 });
 export type MyRoomState = SchemaType<typeof MyRoomState>;

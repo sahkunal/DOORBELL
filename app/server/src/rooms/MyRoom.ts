@@ -1,15 +1,25 @@
-import { Room, Client, CloseCode, type StepContext } from "colyseus";
-import { MyRoomState, Player, Gun, MoveInput } from "./schema/MyRoomState.js";
+import { Room, Client, CloseCode, matchMaker, type StepContext } from "colyseus";
+import { MyRoomState, Player, MoveInput, Gun } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
+import { stepGunFiring } from "../shared/gunFiring.js";
+import { applyGunDamage } from "../shared/gunDamage.js";
 import {
   TICK_RATE, SPAWN_TILES, getSpawnPixel,
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
   getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
-  BUILD_TILES_PER_ROOM, getRoomBuildTilePixel, GUN_COST, COIN_INTERVAL_MS,
+  BUILD_TILES_PER_ROOM, GUN_COST, COIN_INTERVAL_MS, getRoomBuildTilePixel, GUN_RANGE,
+  MAX_PLAYERS, GHOST_SPAWN_TILE, PREPARATION_DURATION_MS,
 } from "../shared/constants.js";
+import { pickGhost } from "../shared/roles.js";
+import { stepMatchPhase } from "../shared/matchPhase.js";
+import { generateRoomCode } from "../shared/roomCode.js";
 
 interface ToggleDoorMessage {
   roomIndex?: number;
+}
+
+interface ReadyMessage {
+  ready?: boolean;
 }
 
 interface BuildMessage {
@@ -17,10 +27,19 @@ interface BuildMessage {
 }
 
 export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
-  // Milestone 5: the room is sized for exactly the 4 players the arena
-  // has deterministic spawn slots for.
-  maxClients = 4;
+  // 4 Defenders + 1 Ghost.
+  maxClients = MAX_PLAYERS;
   state = new MyRoomState();
+
+  // Set once by startMatch(); roles never re-roll after that.
+  private rolesAssigned = false;
+
+  // Server-only ms left in preparation; state.preparationSecondsLeft is
+  // just its rounded-up display value.
+  private preparationRemainingMs = 0;
+
+  // Source of randomness for Ghost selection — replaceable in tests.
+  random: () => number = Math.random;
 
   /**
    * Per-client input buffer. `sanitize` clamps every field as it is decoded —
@@ -33,7 +52,11 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   });
 
   private joinCount = 0;
+
   private nextGunId = 1;
+
+  // Server-only remaining cooldown per gun id — see shared/gunFiring.ts.
+  private gunCooldownsMs = new Map<string, number>();
 
   // Per-session accrued sleep time in ms, not yet converted into a whole
   // coin — a plain map alongside `inputs` rather than schema state, since
@@ -43,6 +66,36 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   messages = {
     // movement arrives through the input buffer above — register handlers here
     // only for things that are not inputs (chat, emotes, …).
+
+    /** Sets the SENDER's own ready flag; there is no way to name another player. */
+    ready: (client: Client, message: ReadyMessage) => {
+      if (this.state.phase !== "lobby") { return; }
+
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+      if (typeof message?.ready !== "boolean") { return; }
+
+      player.ready = message.ready;
+    },
+
+    /**
+     * Host-only, and the ONLY way a match begins. Accepted only in the
+     * lobby with exactly MAX_PLAYERS players, all ready. On success the
+     * room locks and the match starts in the same message: roles, Ghost
+     * spawn, "preparation".
+     */
+    startGame: (client: Client) => {
+      if (this.state.phase !== "lobby") { return; }
+      if (client.sessionId !== this.state.hostId) { return; }
+      if (this.state.players.size !== MAX_PLAYERS) { return; }
+
+      for (const player of this.state.players.values()) {
+        if (!player.ready) { return; }
+      }
+
+      this.lock();
+      this.startMatch();
+    },
 
     /**
      * The client only ever REQUESTS a toggle for a specific room — it never
@@ -88,6 +141,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     toggleSleep: (client: Client) => {
       const player = this.state.players.get(client.sessionId);
       if (!player) { return; }
+      if (player.role === "ghost") { return; }
 
       // Waking up never needs a proximity check — keep the current
       // authoritative position, just resume movement. The room's door
@@ -143,6 +197,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (!player) { return; }
 
       // Only the sleeping defender of a room may build in it.
+      if (player.role === "ghost") { return; }
       if (!player.sleeping) { return; }
       if (player.roomIndex < 0) { return; }
 
@@ -162,22 +217,30 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (this.state.buildTilesOccupied[globalTileIndex]) { return; }
       if (player.coins < GUN_COST) { return; }
 
-      const pos = getRoomBuildTilePixel(ROOM_POSITIONS[player.roomIndex], tileIndex);
-      const gunId = `gun-${this.nextGunId++}`;
-
       player.coins -= GUN_COST;
       this.state.buildTilesOccupied[globalTileIndex] = true;
-      this.state.guns.set(gunId, new Gun({
+
+      const id = `gun-${this.nextGunId++}`;
+      const position = getRoomBuildTilePixel(ROOM_POSITIONS[player.roomIndex], tileIndex);
+
+      this.state.guns.set(id, new Gun({
+        id,
         roomIndex: player.roomIndex,
         tileIndex,
-        x: pos.x,
-        y: pos.y,
+        x: position.x,
+        y: position.y,
         type: "basic",
       }));
     },
   };
 
-  onCreate(options: any) {
+  async onCreate(options: any) {
+    // The share code IS the roomId (settable only here), so joining by
+    // code is just `client.joinById(code)` — no separate lookup table.
+    const code = await this.generateUniqueRoomCode();
+    this.roomId = code;
+    this.state.roomCode = code;
+
     // Four independent doors, one per ROOM_POSITIONS entry, all starting
     // closed and unlocked.
     this.state.doorsOpen.push(false, false, false, false);
@@ -192,7 +255,24 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     this.setFixedTimestep((ctx) => this.step(ctx), TICK_RATE);
   }
 
+  private async generateUniqueRoomCode(): Promise<string> {
+    // 31^5 ≈ 28.6M codes; a collision among live rooms is very unlikely,
+    // but checked anyway since there's no database to rely on.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const code = generateRoomCode();
+      const existing = await matchMaker.query({ roomId: code });
+      if (existing.length === 0) { return code; }
+    }
+    throw new Error("could not allocate a unique room code");
+  }
+
   onJoin(client: Client, options: any) {
+    // Belt and braces with this.lock() in startGame: no new seats once
+    // the lobby has closed.
+    if (this.state.phase !== "lobby") {
+      throw new Error("match already started");
+    }
+
     console.log(client.sessionId, "joined!");
 
     // Deterministic spawn in the 2x2 open plaza at the arena center — no
@@ -210,13 +290,86 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       vy: 0,
       roomIndex: -1,
       sleeping: false,
+      ready: false,
+      playerNumber: this.joinCount,
     }));
+
+    if (this.state.hostId === "") {
+      this.state.hostId = client.sessionId;
+    }
+  }
+
+  /**
+   * Called only from a validated startGame. Exactly one Ghost, chosen
+   * server-side; everyone else stays a Defender (the schema default). The
+   * Ghost moves to its own spawn outside every room; Defenders keep
+   * wherever they are; preparation begins. Runs once per room.
+   */
+  private startMatch() {
+    if (this.rolesAssigned) { return; }
+    this.rolesAssigned = true;
+
+    const ghostId = pickGhost([...this.state.players.keys()], this.random);
+
+    for (const [sessionId, player] of this.state.players) {
+      player.role = sessionId === ghostId ? "ghost" : "defender";
+    }
+
+    const ghost = this.state.players.get(ghostId);
+    if (ghost) {
+      // A player picked while asleep in a room must not leave that room's
+      // door locked behind them, or stay "sleeping" as the Ghost.
+      if (ghost.sleeping) {
+        ghost.sleeping = false;
+        if (ghost.roomIndex !== -1) {
+          this.state.doorsLocked[ghost.roomIndex] = false;
+        }
+      }
+
+      const spawn = getSpawnPixel(GHOST_SPAWN_TILE);
+      ghost.x = spawn.x;
+      ghost.y = spawn.y;
+      ghost.vx = 0;
+      ghost.vy = 0;
+    }
+
+    this.state.phase = "preparation";
+    this.preparationRemainingMs = PREPARATION_DURATION_MS;
+    this.state.preparationSecondsLeft = Math.ceil(PREPARATION_DURATION_MS / 1000);
+  }
+
+  /** Advances the server-owned phase clock; the only place preparation ends. */
+  private advancePhase(dtMs: number) {
+    const next = stepMatchPhase(this.state.phase, this.preparationRemainingMs, dtMs);
+    this.preparationRemainingMs = next.preparationRemainingMs;
+
+    if (next.phase !== this.state.phase) {
+      this.state.phase = next.phase;
+    }
+
+    const secondsLeft = Math.ceil(next.preparationRemainingMs / 1000);
+    if (secondsLeft !== this.state.preparationSecondsLeft) {
+      this.state.preparationSecondsLeft = secondsLeft;
+    }
+  }
+
+  /** The Ghost is held in place until the preparation phase ends. */
+  private isFrozen(player: Player): boolean {
+    return player.role === "ghost" && this.state.phase === "preparation";
   }
 
   onLeave(client: Client, code: CloseCode) {
     console.log(client.sessionId, "left!", code);
     this.state.players.delete(client.sessionId);
     this.coinAccumulatorsMs.delete(client.sessionId);
+
+    // Hand host to the longest-connected remaining player (map order is
+    // join order), so the lobby can still be started. Lobby only: once the
+    // match has started the host has no further powers to hand over.
+    if (this.state.phase === "lobby" && this.state.hostId === client.sessionId) {
+      const next = this.state.players.keys().next();
+      this.state.hostId = next.done ? "" : next.value;
+    }
   }
 
   onDispose() {
@@ -236,12 +389,17 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
    * whether they moved, so it never drifts from their actual position.
    */
   private step(ctx: StepContext) {
+    // First, so the tick on which preparation ends already runs as "active".
+    this.advancePhase(ctx.dt * 1000);
+
     for (const [sessionId, player] of this.state.players) {
       const channel = this.inputs.get(sessionId);
 
       if (channel) {
+        // Inputs are always drained; sleeping players and a frozen Ghost
+        // just don't have them applied.
         for (const input of channel) {
-          if (!player.sleeping) {
+          if (!player.sleeping && !this.isFrozen(player)) {
             stepEntity(player, input, ctx.dt, this.state.doorsOpen);
           }
         }
@@ -267,6 +425,57 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       } else {
         this.coinAccumulatorsMs.set(sessionId, 0);
       }
+    }
+
+    this.updateGunTargets();
+
+    const firedGuns = stepGunFiring(
+      this.state.guns.values(),
+      (sessionId) => this.state.players.has(sessionId),
+      this.gunCooldownsMs,
+      ctx.dt * 1000,
+    );
+
+    for (const gun of firedGuns) {
+      applyGunDamage(gun, this.state.players.get(gun.targetId));
+    }
+  }
+
+  /**
+   * Runs after movement so targets reflect this tick's positions. Pure
+   * Euclidean distance on server coordinates — no walls, doors, rooms or
+   * line of sight. A Ghost that has left is simply absent from `players`,
+   * so every gun clears on the next tick.
+   */
+  private updateGunTargets() {
+    let ghostId = "";
+    let ghost: Player | undefined;
+
+    for (const [sessionId, player] of this.state.players) {
+      if (player.role === "ghost") {
+        ghostId = sessionId;
+        ghost = player;
+        break;
+      }
+    }
+
+    // An unreleased Ghost isn't a valid target: no target means no shot,
+    // so no damage, for the whole preparation phase.
+    if (ghost && this.isFrozen(ghost)) {
+      ghost = undefined;
+    }
+
+    for (const gun of this.state.guns.values()) {
+      if (!ghost) {
+        gun.targetId = "";
+        continue;
+      }
+
+      const dx = ghost.x - gun.x;
+      const dy = ghost.y - gun.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      gun.targetId = distance <= GUN_RANGE ? ghostId : "";
     }
   }
 

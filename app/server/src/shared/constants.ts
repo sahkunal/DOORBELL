@@ -156,6 +156,21 @@ export function getRoomBuildTilePixel(room: { tileX: number; tileY: number }, ti
 /** Coin cost of one gun — unchanged from the previous (client-only) economy. */
 export const GUN_COST = 50;
 
+/**
+ * Max Euclidean distance (px) at which a gun targets the Ghost. Pure
+ * distance — walls, doors and rooms deliberately do not block targeting.
+ */
+export const GUN_RANGE = 180;
+
+/** Minimum time between two shots from the same gun. */
+export const GUN_FIRE_RATE_MS = 1000;
+
+/** Health removed from the Ghost by one gun shot. */
+export const GUN_DAMAGE = 10;
+
+/** Starting and maximum health for every player. */
+export const PLAYER_MAX_HEALTH = 100;
+
 /** How often a sleeping player earns one coin — unchanged from the previous (client-only) economy. */
 export const COIN_INTERVAL_MS = 1000;
 
@@ -214,6 +229,20 @@ export const SPAWN_TILES: ReadonlyArray<{ tileX: number; tileY: number }> = [
   { tileX: 15, tileY: 12 },
   { tileX: 16, tileY: 12 },
 ];
+
+/**
+ * Where the Ghost is placed when roles are assigned: the left margin
+ * (columns 1-3, left of rooms 1/3) at the row of the horizontal gap
+ * between room rows — outside every room and inside the boundary ring.
+ * Pixel (150, 690) via getSpawnPixel.
+ */
+export const GHOST_SPAWN_TILE = { tileX: 2, tileY: 11 };
+
+/** Players per match: 4 Defenders + 1 Ghost. */
+export const MAX_PLAYERS = 5;
+
+/** How long the Ghost is held at its spawn after roles are assigned. */
+export const PREPARATION_DURATION_MS = 25_000;
 
 /** Spawn pixel = tile CENTER (players render from their center point). */
 export function getSpawnPixel(tile: { tileX: number; tileY: number }): { x: number; y: number } {

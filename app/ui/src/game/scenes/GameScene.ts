@@ -1,18 +1,19 @@
 import Phaser from "phaser";
 import { getStateCallbacks, type InputHandle, type Room } from "@colyseus/sdk";
 import { Player } from "../entities/Player";
-import { RemotePlayer } from "../entities/RemotePlayer";
+import { RemotePlayer, GHOST_TINT, GHOST_ALPHA } from "../entities/RemotePlayer";
 import { Bed } from "../entities/Bed";
 import { BuildTile } from "../entities/BuildTile";
 import { Gun } from "../entities/Gun";
-import { GameClient } from "../network/GameClient";
 
 type TilePosition = { tileX: number; tileY: number };
 type PixelPosition = { x: number; y: number };
 
+/** Registry key under which createGame() hands this scene the joined room. */
+export const ROOM_REGISTRY_KEY = "room";
+
 export class GameScene extends Phaser.Scene {
 
-    private gameClient!: GameClient;
     private room?: Room;
     private remotePlayers = new Map<string, RemotePlayer>();
     private moveInput?: InputHandle<{ moveX: number; moveY: number }>;
@@ -25,7 +26,7 @@ export class GameScene extends Phaser.Scene {
     // Flat lookup by the same global index the server uses
     // (roomIndex * buildTilesPerRoom + tileIndex) — see MyRoomState.buildTilesOccupied.
     private buildTilesByGlobalIndex: BuildTile[] = [];
-    private guns: Gun[] = [];
+    // Visuals for MyRoomState.guns, keyed by the server's gun id.
     private gunsById = new Map<string, Gun>();
 
     // Authoritative room the local player currently occupies, mirrored
@@ -45,12 +46,18 @@ export class GameScene extends Phaser.Scene {
 
     private isSleeping = false;
 
+    // Mirrors the synced Player.role — public, never decided client-side.
+    private isLocalGhost = false;
+    private ghostSessionId = "";
+    private ghostLabel!: Phaser.GameObjects.Text;
+
     // Free-look camera panning, enabled only while sleeping (see
     // applySleepingState()). Client-side only — never synchronized, and
     // never moves the player itself.
     private isDraggingCamera = false;
 
     private coinsText!: Phaser.GameObjects.Text;
+    private phaseText!: Phaser.GameObjects.Text;
     private sleepingText!: Phaser.GameObjects.Text;
     private buildMenu?: Phaser.GameObjects.Container;
 
@@ -86,143 +93,6 @@ export class GameScene extends Phaser.Scene {
     }
 
     create() {
-
-        this.gameClient = new GameClient();
-
-        this.gameClient.connect()
-            .then((room) => {
-                console.log("Doorbell connected!");
-                console.log("My session:", room.sessionId);
-
-                this.room = room;
-
-                // The server already knows MoveInput's shape (MyRoom calls
-                // defineInput(MoveInput)) and sends it during the join
-                // handshake, so no schema import is needed on this side.
-                this.moveInput = room.input();
-
-                const $ = getStateCallbacks(room);
-
-                // The server owns doorsOpen — this only reacts to it. onAdd
-                // fires once per existing entry immediately on subscribe
-                // (all 4, already pushed server-side before any client can
-                // join), so a client joining mid-game renders every room's
-                // current state right away, not just future toggles.
-                $(room.state).doorsOpen.onAdd((isOpen: boolean, roomIndex: number) => {
-                    this.setDoorVisual(roomIndex, isOpen);
-                }, true);
-
-                $(room.state).doorsOpen.onChange((isOpen: boolean, roomIndex: number) => {
-                    this.setDoorVisual(roomIndex, isOpen);
-                });
-
-                // Same pattern as doorsOpen above, kept as its own parallel
-                // array/listener rather than folded into setDoorVisual —
-                // open/closed and locked/unlocked can each change on their
-                // own (e.g. waking unlocks without opening the door).
-                $(room.state).doorsLocked.onAdd((isLocked: boolean, roomIndex: number) => {
-                    this.setDoorLockVisual(roomIndex, isLocked);
-                }, true);
-
-                $(room.state).doorsLocked.onChange((isLocked: boolean, roomIndex: number) => {
-                    this.setDoorLockVisual(roomIndex, isLocked);
-                });
-
-                // The server owns occupancy for every build-tile slot
-                // across all four rooms, keyed by the same global index
-                // BuildTile uses (see buildTilesByGlobalIndex). This only
-                // drives the tile's "+"/occupied look; guns themselves
-                // come from the authoritative `guns` map below.
-                $(room.state).buildTilesOccupied.onAdd((isOccupied: boolean, globalIndex: number) => {
-                    this.setBuildTileOccupied(globalIndex, isOccupied);
-                }, true);
-
-                $(room.state).buildTilesOccupied.onChange((isOccupied: boolean, globalIndex: number) => {
-                    this.setBuildTileOccupied(globalIndex, isOccupied);
-                });
-
-                // Guns are public authoritative entities: every client
-                // renders every gun at the server's position.
-                $(room.state).guns.onAdd((gunState, gunId: string) => {
-                    if (this.gunsById.has(gunId)) { return; }
-                    const gun = new Gun(this, gunState.x, gunState.y);
-                    this.gunsById.set(gunId, gun);
-                    this.guns.push(gun);
-                }, true);
-
-                $(room.state).guns.onRemove((_gunState, gunId: string) => {
-                    const gun = this.gunsById.get(gunId);
-                    if (!gun) { return; }
-                    gun.destroy();
-                    this.gunsById.delete(gunId);
-                    this.guns = this.guns.filter((existing) => existing !== gun);
-                });
-
-                $(room.state).players.onAdd((remotePlayerState, sessionId) => {
-                    // The server also creates a state entry for us. The local
-                    // player is already represented by the keyboard-reading
-                    // `Player` instance — just keep its position in sync with
-                    // the authoritative state instead of spawning a RemotePlayer.
-                    if (sessionId === room.sessionId) {
-                        $(remotePlayerState).onChange(() => {
-                            this.player.applyServerPosition(
-                                remotePlayerState.x,
-                                remotePlayerState.y
-                            );
-                        });
-
-                        // The server owns sleeping — this only reacts to
-                        // it. `true` (immediate) applies the current value
-                        // right away for a client joining mid-sleep.
-                        $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
-                            this.applySleepingState(isSleeping);
-                        }, true);
-
-                        // The server owns room membership too — build
-                        // indicators are gated on this + sleeping together
-                        // (see updateBuildVisibility()).
-                        $(remotePlayerState).listen("roomIndex", (roomIndex: number) => {
-                            this.localRoomIndex = roomIndex;
-                            this.updateBuildVisibility();
-                        }, true);
-
-                        // The server owns the coin balance — this label is
-                        // purely a reflection of it, never a local count.
-                        $(remotePlayerState).listen("coins", (coins: number) => {
-                            this.coinsText.setText(`COINS  ${coins}`);
-                        }, true);
-
-                        return;
-                    }
-
-                    const remotePlayer = new RemotePlayer(
-                        this,
-                        remotePlayerState.x,
-                        remotePlayerState.y
-                    );
-
-                    this.remotePlayers.set(sessionId, remotePlayer);
-
-                    $(remotePlayerState).onChange(() => {
-                        remotePlayer.setPosition(
-                            remotePlayerState.x,
-                            remotePlayerState.y
-                        );
-                    });
-
-                    $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
-                        remotePlayer.setSleeping(isSleeping);
-                    }, true);
-                });
-
-                $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
-                    this.remotePlayers.get(sessionId)?.destroy();
-                    this.remotePlayers.delete(sessionId);
-                });
-            })
-            .catch((error) => {
-                console.error("Could not connect to Colyseus:", error);
-            });
 
         this.walls = this.physics.add.staticGroup();
 
@@ -270,6 +140,14 @@ export class GameScene extends Phaser.Scene {
             }
         );
         this.coinsText.setScrollFactor(0);
+
+        this.phaseText = this.add.text(40, 115, "", {
+            fontFamily: "monospace",
+            fontSize: "18px",
+            color: "#8fd8ff",
+        });
+        this.phaseText.setScrollFactor(0);
+
         this.interactText = this.add.text(
             0,
             0,
@@ -306,6 +184,14 @@ export class GameScene extends Phaser.Scene {
 
         this.sleepingText.setVisible(false);
 
+        this.ghostLabel = this.add.text(0, 0, "GHOST", {
+            fontFamily: "monospace",
+            fontSize: "12px",
+            color: "#8fd8ff",
+        });
+        this.ghostLabel.setOrigin(0.5, 1);
+        this.ghostLabel.setVisible(false);
+
         this.input.keyboard!.on("keydown-E", () => {
 
             // Already sleeping: E only ever wakes up — no door interaction
@@ -323,8 +209,8 @@ export class GameScene extends Phaser.Scene {
                 return;
             }
 
-            // Otherwise check bed
-            if (this.isPlayerNearBed()) {
+            // Otherwise check bed (the server rejects Ghost sleep regardless)
+            if (!this.isLocalGhost && this.isPlayerNearBed()) {
                 this.toggleSleeping();
             }
         });
@@ -334,6 +220,158 @@ export class GameScene extends Phaser.Scene {
         });
 
         this.setupCameraDrag();
+
+        // Last: the immediate state callbacks below touch the player and
+        // HUD objects created above.
+        this.bindRoom(this.registry.get(ROOM_REGISTRY_KEY) as Room);
+    }
+
+    // The room was already joined in the lobby — same session, no reconnect.
+    private bindRoom(room: Room) {
+        console.log("Doorbell connected!");
+        console.log("My session:", room.sessionId);
+
+        this.room = room;
+
+        // The server already knows MoveInput's shape (MyRoom calls
+        // defineInput(MoveInput)) and sends it during the join
+        // handshake, so no schema import is needed on this side.
+        this.moveInput = room.input();
+
+        const $ = getStateCallbacks(room);
+
+        // Display only: the server alone decides when preparation ends.
+        $(room.state).listen("phase", () => this.updatePhaseText(), true);
+        $(room.state).listen("preparationSecondsLeft", () => this.updatePhaseText(), true);
+
+        // The server owns doorsOpen — this only reacts to it. onAdd
+        // fires once per existing entry immediately on subscribe
+        // (all 4, already pushed server-side before any client can
+        // join), so a client joining mid-game renders every room's
+        // current state right away, not just future toggles.
+        $(room.state).doorsOpen.onAdd((isOpen: boolean, roomIndex: number) => {
+            this.setDoorVisual(roomIndex, isOpen);
+        }, true);
+
+        $(room.state).doorsOpen.onChange((isOpen: boolean, roomIndex: number) => {
+            this.setDoorVisual(roomIndex, isOpen);
+        });
+
+        // Same pattern as doorsOpen above, kept as its own parallel
+        // array/listener rather than folded into setDoorVisual —
+        // open/closed and locked/unlocked can each change on their
+        // own (e.g. waking unlocks without opening the door).
+        $(room.state).doorsLocked.onAdd((isLocked: boolean, roomIndex: number) => {
+            this.setDoorLockVisual(roomIndex, isLocked);
+        }, true);
+
+        $(room.state).doorsLocked.onChange((isLocked: boolean, roomIndex: number) => {
+            this.setDoorLockVisual(roomIndex, isLocked);
+        });
+
+        // The server owns occupancy for every build-tile slot
+        // across all four rooms, keyed by the same global index
+        // BuildTile uses (see buildTilesByGlobalIndex). This only
+        // drives the tiles' own "+" state; guns render from
+        // state.guns below.
+        $(room.state).buildTilesOccupied.onAdd((isOccupied: boolean, globalIndex: number) => {
+            this.setBuildTileOccupied(globalIndex, isOccupied);
+        }, true);
+
+        $(room.state).buildTilesOccupied.onChange((isOccupied: boolean, globalIndex: number) => {
+            this.setBuildTileOccupied(globalIndex, isOccupied);
+        });
+
+        // Every gun is public: all clients render every entry at
+        // the server-decided x/y, regardless of whose room it's in.
+        $(room.state).guns.onAdd((gunState, gunId: string) => {
+            if (this.gunsById.has(gunId)) { return; }
+            this.gunsById.set(gunId, new Gun(this, gunState.x, gunState.y));
+        }, true);
+
+        $(room.state).guns.onRemove((_gunState, gunId: string) => {
+            this.gunsById.get(gunId)?.destroy();
+            this.gunsById.delete(gunId);
+        });
+
+        $(room.state).players.onAdd((remotePlayerState, sessionId) => {
+            // The server also creates a state entry for us. The local
+            // player is already represented by the keyboard-reading
+            // `Player` instance — just keep its position in sync with
+            // the authoritative state instead of spawning a RemotePlayer.
+            if (sessionId === room.sessionId) {
+                $(remotePlayerState).onChange(() => {
+                    this.player.applyServerPosition(
+                        remotePlayerState.x,
+                        remotePlayerState.y
+                    );
+                });
+
+                // The server owns sleeping — this only reacts to
+                // it. `true` (immediate) applies the current value
+                // right away for a client joining mid-sleep.
+                $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
+                    this.applySleepingState(isSleeping);
+                }, true);
+
+                // The server owns room membership too — build
+                // indicators are gated on this + sleeping together
+                // (see updateBuildVisibility()).
+                $(remotePlayerState).listen("roomIndex", (roomIndex: number) => {
+                    this.localRoomIndex = roomIndex;
+                    this.updateBuildVisibility();
+                }, true);
+
+                // The server owns the coin balance — this label is
+                // purely a reflection of it, never a local count.
+                $(remotePlayerState).listen("coins", (coins: number) => {
+                    this.coinsText.setText(`COINS  ${coins}`);
+                }, true);
+
+                $(remotePlayerState).listen("role", (role: string) => {
+                    this.isLocalGhost = role === "ghost";
+                    if (this.isLocalGhost) {
+                        this.player.setTint(GHOST_TINT);
+                        this.player.setAlpha(GHOST_ALPHA);
+                    }
+                    this.setGhostSession(sessionId, role);
+                }, true);
+
+                return;
+            }
+
+            const remotePlayer = new RemotePlayer(
+                this,
+                remotePlayerState.x,
+                remotePlayerState.y
+            );
+
+            this.remotePlayers.set(sessionId, remotePlayer);
+
+            $(remotePlayerState).onChange(() => {
+                remotePlayer.setPosition(
+                    remotePlayerState.x,
+                    remotePlayerState.y
+                );
+            });
+
+            $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
+                remotePlayer.setSleeping(isSleeping);
+            }, true);
+
+            $(remotePlayerState).listen("role", (role: string) => {
+                remotePlayer.setRole(role);
+                this.setGhostSession(sessionId, role);
+            }, true);
+        });
+
+        $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
+            this.remotePlayers.get(sessionId)?.destroy();
+            this.remotePlayers.delete(sessionId);
+            if (this.ghostSessionId === sessionId) {
+                this.ghostSessionId = "";
+            }
+        });
     }
 
     // Free-look panning for a sleeping defender — the player stays locked
@@ -372,6 +410,8 @@ export class GameScene extends Phaser.Scene {
     }
 
     update(_time: number, _delta: number) {
+        this.updateGhostLabel();
+
         // If the player is sleeping (server-authoritative — see
         // applySleepingState()), don't allow movement.
         if (this.isSleeping) {
@@ -427,7 +467,7 @@ export class GameScene extends Phaser.Scene {
             return;
         }
 
-        const nearbyBed = this.getNearbyBed();
+        const nearbyBed = this.isLocalGhost ? undefined : this.getNearbyBed();
 
         if (nearbyBed) {
 
@@ -717,16 +757,9 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Reacts to the server's authoritative buildTilesOccupied flag for one
-    // global tile index — never set locally by a click. Drives both the
-    // tile's own "+"/occupied visual. The Gun itself comes from the
-    // authoritative `guns` map, not from this flag.
+    // global tile index — never set locally by a click.
     private setBuildTileOccupied(globalIndex: number, isOccupied: boolean) {
-        const tile = this.buildTilesByGlobalIndex[globalIndex];
-
-        if (tile) {
-            tile.setOccupied(isOccupied);
-        }
-
+        this.buildTilesByGlobalIndex[globalIndex]?.setOccupied(isOccupied);
         this.updateBuildVisibility();
     }
 
@@ -749,6 +782,43 @@ export class GameScene extends Phaser.Scene {
 
         body.enable = !isOpen;
         this.drawDoorVisual(graphics, position, isOpen, isLocked);
+    }
+
+    private updatePhaseText() {
+        const state = this.room?.state;
+        if (!state) { return; }
+
+        if (state.phase === "preparation") {
+            this.phaseText.setText(`PREPARATION  ${state.preparationSecondsLeft}`);
+        } else if (state.phase === "active") {
+            this.phaseText.setText("ACTIVE");
+        } else {
+            this.phaseText.setText("");
+        }
+    }
+
+    private setGhostSession(sessionId: string, role: string) {
+        if (role === "ghost") {
+            this.ghostSessionId = sessionId;
+        } else if (this.ghostSessionId === sessionId) {
+            this.ghostSessionId = "";
+        }
+    }
+
+    // Before update()'s sleeping early-return, so the label keeps tracking
+    // the Ghost for a sleeping defender too.
+    private updateGhostLabel() {
+        const sprite = this.ghostSessionId === this.room?.sessionId
+            ? this.player
+            : this.remotePlayers.get(this.ghostSessionId);
+
+        if (!this.ghostSessionId || !sprite) {
+            this.ghostLabel.setVisible(false);
+            return;
+        }
+
+        this.ghostLabel.setVisible(true);
+        this.ghostLabel.setPosition(sprite.x, sprite.y - 20);
     }
 
     // Requests a sleep/wake toggle — does NOT flip isSleeping itself. The
